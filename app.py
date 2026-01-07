@@ -12,9 +12,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 
 # --- IMPORTS ---
-from langchain_google_genai import ChatGoogleGenerativeAI
-# NEW: FastEmbed is lighter and works reliably on Free Tier
-from langchain_community.embeddings import FastEmbedEmbeddings 
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -22,11 +20,10 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
 # ---------------------------------------------------------
-# 1. CONFIGURATION & INITIALIZATION
+# 1. CONFIGURATION
 # ---------------------------------------------------------
 st.set_page_config(page_title="The Stratagem Journal", layout="wide")
 
-# API Key Check
 api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     try:
@@ -35,7 +32,6 @@ if not api_key:
         st.error("⚠️ GOOGLE_API_KEY not found. Please set it in Streamlit Secrets.")
         st.stop()
 
-# Initialize Local Database (SQLite)
 def init_db():
     conn = sqlite3.connect('stratagem.db')
     c = conn.cursor()
@@ -48,13 +44,27 @@ def init_db():
 
 init_db()
 
-# --- CRITICAL FIX: USE FASTEMBED ---
-# This runs on CPU, is lightweight, and solves the ImportError.
-@st.cache_resource
-def get_embedding_model():
-    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
+# ---------------------------------------------------------
+# 2. THE RATE-LIMIT FIX (THROTTLING)
+# ---------------------------------------------------------
+# This custom class inserts a pause so we don't crash the Free Tier.
+class ThrottledGoogleEmbeddings(GoogleGenerativeAIEmbeddings):
+    def embed_documents(self, texts):
+        embeddings = []
+        # Create a progress bar in the UI if possible, or just log
+        total = len(texts)
+        for i, text in enumerate(texts):
+            # Embed single document
+            embeddings.append(self.embed_query(text))
+            # Wait 1.5 seconds between requests to stay under 60 RPM
+            time.sleep(1.5) 
+        return embeddings
 
-embeddings = get_embedding_model()
+# Use the throttled model
+embeddings = ThrottledGoogleEmbeddings(
+    model="models/embedding-001", 
+    google_api_key=api_key
+)
 
 # Persistent Client setup
 PERSIST_DIRECTORY = "./chroma_db"
@@ -71,7 +81,6 @@ library_collection = Chroma(
     embedding_function=embeddings,
 )
 
-# Initialize Gemini Model (Only for Thinking)
 llm = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
     temperature=0.7,
@@ -81,21 +90,18 @@ llm = ChatGoogleGenerativeAI(
 )
 
 # ---------------------------------------------------------
-# 2. AGENT PERSONAS
+# 3. AGENT PERSONAS
 # ---------------------------------------------------------
-
 red_team_prompt = ChatPromptTemplate.from_template("""
 You are 'The Red Teamer'.
 Philosophy:
-1. [cite_start]"Comfort doesn’t sharpen you; a superior opponent exposes blind spots." [cite: 7]
-2. [cite_start]"The More Sophisticated the Game, the More Sophisticated the Opponent." [cite: 10]
-3. [cite_start]"The Game Stops When You Start Giving Answers." [cite: 14]
-
+1. "Comfort doesn’t sharpen you; a superior opponent exposes blind spots."
+2. "The More Sophisticated the Game, the More Sophisticated the Opponent."
+3. "The Game Stops When You Start Giving Answers."
 Task: Analyze the user's journal entry.
 - Identify where they accepted 'answers' instead of asking 'questions'.
 - Map stakeholder incentives they might have missed.
 - Critique their specific decisions (not their results).
-
 User Entry: {entry}
 Analysis:
 """)
@@ -103,22 +109,20 @@ Analysis:
 ego_surgeon_prompt = ChatPromptTemplate.from_template("""
 You are 'The Ego Surgeon'.
 Philosophy:
-1. [cite_start]The ego is the opponent. It "layers sophistication" and "provides ready-made answers." [cite: 24, 29]
+1. The ego is the opponent. It "layers sophistication" and "provides ready-made answers."
 2. Use the "Surgical Method":
-   - [cite_start]"Name the voice" (e.g., The Voice of Shame). [cite: 35]
-   - [cite_start]"Adversarial Questioning": Ask "Who benefits if this thought is true?" [cite: 36]
-   - [cite_start]"Evidence Audit": List objective facts vs. feelings. [cite: 42]
-
+   - "Name the voice" (e.g., The Voice of Shame).
+   - "Adversarial Questioning": Ask "Who benefits if this thought is true?"
+   - "Evidence Audit": List objective facts vs. feelings.
 Task: Analyze the user's journal entry for emotional fusion.
 User Entry: {entry}
 Diagnosis & Surgical Steps:
 """)
 
 architect_prompt = ChatPromptTemplate.from_template("""
-You are 'The Architect'. You bridge external knowledge (Books) with internal reality.
+You are 'The Architect'.
 Context from Library: {book_context}
 User's Current Struggle: {query}
-
 Task:
 1. Extract a specific 'Protocol' from the book context.
 2. Apply it directly to the user's struggle.
@@ -126,13 +130,11 @@ Task:
 """)
 
 # ---------------------------------------------------------
-# 3. LOGIC FUNCTIONS
+# 4. LOGIC FUNCTIONS
 # ---------------------------------------------------------
-
 def save_entry(category, content, analysis):
     entry_id = str(uuid.uuid4())
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
     conn = sqlite3.connect('stratagem.db')
     c = conn.cursor()
     c.execute("INSERT INTO journal VALUES (?, ?, ?, ?, ?)", 
@@ -140,6 +142,7 @@ def save_entry(category, content, analysis):
     conn.commit()
     conn.close()
     
+    # Add to Vector DB (With throttling handled by the class above)
     journal_collection.add_documents(documents=[
         RecursiveCharacterTextSplitter().create_documents([content], metadatas=[{"date": date_str, "category": category}])[0]
     ])
@@ -148,10 +151,7 @@ def run_safe_chain(chain, inputs):
     try:
         return chain.invoke(inputs)
     except Exception as e:
-        if "429" in str(e):
-            return "⚠️ **Rate Limit Hit:** The AI is thinking too fast for the free tier. Please wait 60 seconds and try again."
-        else:
-            return f"⚠️ Error: {str(e)}"
+        return f"⚠️ Error: {str(e)}"
 
 def process_journal(category, content):
     if category == "Career / Strategy":
@@ -168,20 +168,20 @@ def ingest_file(uploaded_file):
     loader = PyPDFLoader(f"temp_{uploaded_file.name}")
     pages = loader.load_and_split()
     
+    # This will now use the Throttled Embeddings (Slow but Safe)
     library_collection.add_documents(pages)
     os.remove(f"temp_{uploaded_file.name}")
     return len(pages)
 
 # ---------------------------------------------------------
-# 4. UI LAYOUT
+# 5. UI LAYOUT
 # ---------------------------------------------------------
-
 st.title("♟️ The Stratagem Journal")
 st.markdown("*Operationalizing 'How to Win at Any Game or Con'*")
 
 tabs = st.tabs(["📝 Daily Journal", "📚 The Library", "⚙️ Protocols", "🗄️ Archives"])
 
-# --- TAB 1: JOURNAL ---
+# TAB 1: JOURNAL
 with tabs[0]:
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -193,29 +193,28 @@ with tabs[0]:
             if not journal_text:
                 st.warning("Please write something first.")
             else:
-                with st.spinner("Gemini Agents are Red Teaming your entry..."):
+                with st.spinner("Red Teaming your entry..."):
                     analysis_result = process_journal(category, journal_text)
                     st.success("Analysis Complete")
                     st.markdown("### 🕵️ Agent Report")
                     st.markdown(analysis_result)
                     if "⚠️" not in analysis_result:
                         save_entry(category, journal_text, analysis_result)
-
     with col2:
         st.info("💡 **Tip:** Be honest. The Ego Surgeon is watching for 'ready-made answers'.")
 
-# --- TAB 2: LIBRARY ---
+# TAB 2: LIBRARY
 with tabs[1]:
     st.header("The Knowledge Lab")
-    st.caption("Running FastEmbed Locally (High Speed / No Limits)")
+    st.caption("Using Throttled Google Embeddings (Safe Mode)")
     uploaded_file = st.file_uploader("Upload Strategy Docs (PDF)", type="pdf")
     if uploaded_file and st.button("Ingest"):
-        with st.spinner("Embedding knowledge locally..."):
+        with st.spinner("Embedding... This will take longer to avoid rate limits (approx 1.5s per page)."):
             try:
                 num = ingest_file(uploaded_file)
                 st.success(f"Ingested {num} pages.")
             except Exception as e:
-                st.error(f"Error reading PDF: {e}")
+                st.error(f"Error: {e}")
 
     st.divider()
     user_query = st.text_input("Brainstorm with The Architect:")
@@ -232,7 +231,7 @@ with tabs[1]:
         except Exception as e:
             st.error(f"Search Error: {str(e)}")
 
-# --- TAB 3: PROTOCOLS ---
+# TAB 3: PROTOCOLS
 with tabs[2]:
     st.header("Active Protocols")
     with st.expander("Add New Protocol"):
@@ -256,12 +255,11 @@ with tabs[2]:
     else:
         st.write("No active protocols.")
 
-# --- TAB 4: ARCHIVES ---
+# TAB 4: ARCHIVES
 with tabs[3]:
     st.header("History")
     if st.button("Refresh Archives"):
         st.rerun()
-        
     conn = sqlite3.connect('stratagem.db')
     try:
         rows = conn.execute("SELECT date, category, content, analysis FROM journal ORDER BY date DESC").fetchall()
@@ -270,7 +268,6 @@ with tabs[3]:
             with st.expander(f"{r[0]} | {r[1]}"):
                 st.write(r[2])
                 st.divider()
-                st.caption("Analysis")
                 st.write(r[3])
     except:
         st.write("No entries yet.")
