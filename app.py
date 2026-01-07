@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 
 # --- IMPORTS ---
 from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_community.embeddings import HuggingFaceEmbeddings  # <--- NEW: Local Embeddings
+# NEW: FastEmbed is lighter and works reliably on Free Tier
+from langchain_community.embeddings import FastEmbedEmbeddings 
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
@@ -47,11 +48,11 @@ def init_db():
 
 init_db()
 
-# --- CRITICAL FIX: USE LOCAL EMBEDDINGS ---
-# This runs on the CPU, costs $0, and never hits a rate limit.
+# --- CRITICAL FIX: USE FASTEMBED ---
+# This runs on CPU, is lightweight, and solves the ImportError.
 @st.cache_resource
 def get_embedding_model():
-    return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    return FastEmbedEmbeddings(model_name="BAAI/bge-small-en-v1.5")
 
 embeddings = get_embedding_model()
 
@@ -70,7 +71,7 @@ library_collection = Chroma(
     embedding_function=embeddings,
 )
 
-# Initialize Gemini Model (Only for Thinking, not Embedding)
+# Initialize Gemini Model (Only for Thinking)
 llm = ChatGoogleGenerativeAI(
     model="gemini-1.5-flash",
     temperature=0.7,
@@ -102,10 +103,10 @@ Analysis:
 ego_surgeon_prompt = ChatPromptTemplate.from_template("""
 You are 'The Ego Surgeon'.
 Philosophy:
-1. [cite_start]The ego is the opponent. It "layers sophistication" and "provides ready-made answers." [cite: 27, 29]
+1. [cite_start]The ego is the opponent. It "layers sophistication" and "provides ready-made answers." [cite: 24, 29]
 2. Use the "Surgical Method":
-   - [cite_start]"Name the voice" (e.g., The Voice of Shame). [cite: 39]
-   - [cite_start]"Adversarial Questioning": Ask "Who benefits if this thought is true?" [cite: 42]
+   - [cite_start]"Name the voice" (e.g., The Voice of Shame). [cite: 35]
+   - [cite_start]"Adversarial Questioning": Ask "Who benefits if this thought is true?" [cite: 36]
    - [cite_start]"Evidence Audit": List objective facts vs. feelings. [cite: 42]
 
 Task: Analyze the user's journal entry for emotional fusion.
@@ -132,7 +133,6 @@ def save_entry(category, content, analysis):
     entry_id = str(uuid.uuid4())
     date_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
-    # SQLite Save
     conn = sqlite3.connect('stratagem.db')
     c = conn.cursor()
     c.execute("INSERT INTO journal VALUES (?, ?, ?, ?, ?)", 
@@ -140,13 +140,11 @@ def save_entry(category, content, analysis):
     conn.commit()
     conn.close()
     
-    # Vector Save
     journal_collection.add_documents(documents=[
         RecursiveCharacterTextSplitter().create_documents([content], metadatas=[{"date": date_str, "category": category}])[0]
     ])
 
 def run_safe_chain(chain, inputs):
-    """Wrapper to handle 429 errors gracefully"""
     try:
         return chain.invoke(inputs)
     except Exception as e:
@@ -164,14 +162,12 @@ def process_journal(category, content):
         return run_safe_chain(chain, {"entry": content})
 
 def ingest_file(uploaded_file):
-    # Create a temp file
     with open(f"temp_{uploaded_file.name}", "wb") as f:
         f.write(uploaded_file.getbuffer())
     
     loader = PyPDFLoader(f"temp_{uploaded_file.name}")
     pages = loader.load_and_split()
     
-    # Embed locally (This part is now Safe from 429s!)
     library_collection.add_documents(pages)
     os.remove(f"temp_{uploaded_file.name}")
     return len(pages)
@@ -202,7 +198,6 @@ with tabs[0]:
                     st.success("Analysis Complete")
                     st.markdown("### 🕵️ Agent Report")
                     st.markdown(analysis_result)
-                    # Only save if it wasn't an error message
                     if "⚠️" not in analysis_result:
                         save_entry(category, journal_text, analysis_result)
 
@@ -212,7 +207,7 @@ with tabs[0]:
 # --- TAB 2: LIBRARY ---
 with tabs[1]:
     st.header("The Knowledge Lab")
-    st.caption("Embeddings now run locally (No Rate Limits!)")
+    st.caption("Running FastEmbed Locally (High Speed / No Limits)")
     uploaded_file = st.file_uploader("Upload Strategy Docs (PDF)", type="pdf")
     if uploaded_file and st.button("Ingest"):
         with st.spinner("Embedding knowledge locally..."):
@@ -271,7 +266,6 @@ with tabs[3]:
     try:
         rows = conn.execute("SELECT date, category, content, analysis FROM journal ORDER BY date DESC").fetchall()
         conn.close()
-        
         for r in rows:
             with st.expander(f"{r[0]} | {r[1]}"):
                 st.write(r[2])
